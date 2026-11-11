@@ -4,7 +4,7 @@
 #   cd peer1 && ./peer
 
 CC = gcc
-CFLAGS = -std=c11 -Wall -Wextra -O2
+CFLAGS = -std=gnu11 -Wall -Wextra -O2
 EXE =
 
 ifeq ($(OS),Windows_NT)
