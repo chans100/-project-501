@@ -31,3 +31,6 @@ Includes reference files for development that are not directly used by the progr
 
 ## `./peer1` `./peer2` `./peer3`
 These folders isolate each of the client instances to simulate multiple peers on a single machine.
+
+### `./peer*/torrents`
+The shared folder for each peer.
