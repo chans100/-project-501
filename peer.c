@@ -2,11 +2,15 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
+#define LIST 3 	// TEMP
 
-
-main(int argc,char *argv[]){
+int main(int argc,char *argv[]){
 	
+	char * msg;	// TEMP
    	char server_address[50];
 	int server_port=3490;  // you should instead read from configuration file
     
@@ -15,14 +19,16 @@ main(int argc,char *argv[]){
 	int sockid;
         
 	if ((sockid = socket(AF_INET,SOCK_STREAM,0))==-1){//create socket
-		printf("socket cannot be created\n"); exit(0);
+		printf("socket cannot be created\n");
+		return 0;
 	}
                                               
    
     server_addr.sin_family = AF_INET;//host byte order
     server_addr.sin_port = htons(server_port);// convert to network byte order
     if (connect(sockid ,(struct sockaddr *) &server_addr,sizeof(struct sockaddr))==-1){//connect and error check
-		printf("Cannot connect to server\n"); exit(0);
+		printf("Cannot connect to server\n");
+		return 0;
 	}
 
    /* If connected successfully*/
@@ -34,12 +40,13 @@ main(int argc,char *argv[]){
 		}
 
         if((read(sockid,(char *)&msg,sizeof(msg)))< 0){// read what server has said
-			printf("Read  failure\n"); exit(0); 
+			printf("Read  failure\n");
+			return 0; 
 		}
 		
 		close(sockid);
 		printf("Connection closed\n");
-	    exit(0);
+	    return 0;
 	}//end close
 
     
