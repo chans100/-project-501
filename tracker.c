@@ -6,13 +6,18 @@
 
 
 
-main(){
+int main(){
+	/* TEMP COMMENT
+	int sockid;
 	pid_t pid;
    struct sockaddr_in server_addr, client_addr;   
    if ((sockid = socket(AF_INET,SOCK_STREAM,0)) < 0){//create socket connection oriented
-	   printf("socket cannot be created \n"); exit(0); 
+	   printf("socket cannot be created \n"); 
+	   return 0; 
    }
     
+   
+
    //socket created at this stage
    //now associate the socket with local port to allow listening incoming connections
    server_addr.sin_family = AF_INET;// assign address family
@@ -29,7 +34,7 @@ main(){
    }                                        
    
    while(1) { //accept  connection from every requester client
-	   if ((sock_child = accept(sockid ,(struct sockaddr *) &client_addr,&clilen))==-1){ /* accept connection and create a socket descriptor for actual work */
+	   if ((sock_child = accept(sockid ,(struct sockaddr *) &client_addr,&clilen))==-1){ // accept connection and create a socket descriptor for actual work
 		   printf("Tracker Cannot accept...\n"); exit(0); 
 	   }
 
@@ -41,12 +46,13 @@ main(){
         }
 	   close(sock_child);  // parent all done with client, only child will communicate with that client from now
 	   
-     }  //accept loop ends            
+     }  //accept loop ends        
+	*/
 } // main fun ends  
      
 
 
-
+/*
 peer_handler(int sock_child){ // function for file transfer. child process will call this function     
     //start handiling client request	
 	int length;
@@ -70,6 +76,8 @@ peer_handler(int sock_child){ // function for file transfer. child process will 
 		handle_updatetracker_req(sock_child);		
 	}
 	
+	
 }//end client handler function
+*/
 
 
