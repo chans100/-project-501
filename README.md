@@ -3,7 +3,7 @@ To create the program for execution run the following command in the directory:
 
 ```$ make -f makefile```
 
-# Executing the Progrma
+# Executing the Program
 
 ## Server
 On the server instance run the following:
