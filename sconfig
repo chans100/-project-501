@@ -1,0 +1,6 @@
+# Port the tracker listens on.
+3490
+# Folder where tracker files are stored.
+torrents
+# Drop a peer that has not sent updatetracker for this many seconds.
+900
