@@ -181,10 +181,61 @@ static void handle_get_req(socket_t sock, const char *name) {
     send_str(sock, "<$REP GET ferr>\n");
 }
 
-static void handle_createtracker_req(socket_t sock) {
-    /* TODO: create torrents/<filename>.track if it does not already exist. */
-    logmsg("createtracker is not implemented yet\n");
-    send_str(sock, "<$createtracker fail>\n");
+static void handle_createtracker_req(socket_t sock, const char *request) {
+    char command[32];
+    char filename[256];
+    int filesize = 0;
+    char description[512];
+    char md5[33];
+    char ip[64];
+    int port = 0;
+    int fields;
+    char path[512];
+    FILE *f;
+    size_t i;
+
+    fields = sscanf(request, "%31s %255s %d %511s %32s %63s %d",
+                    command, filename, &filesize, description, md5, ip, &port);
+    if (fields != 7) {
+        send_str(sock, "<$createtracker fail>\n");
+        return;
+    }
+
+    if (path_join(path, sizeof path, torrent_dir, filename) != 0) {
+        send_str(sock, "<$createtracker fail>\n");
+        return;
+    }
+    strcat(path, ".track");
+
+    logmsg(path);
+    f = fopen(path, "rb");
+    if (f) {
+        fclose(f);
+        send_str(sock, "<$createtracker ferr>\n");
+        return;
+    }
+
+    f = fopen(path, "w");
+    if (!f) {
+        send_str(sock, "<$createtracker fail>\n");
+        return;
+    }
+    else
+    {
+        time_t timestamp = time(NULL);
+        int failed = fprintf(f, "Filename: %s\nFizesize: %d\nDescriptions: %s\nMD5: %s\n%s:%d:0:%d:%lld\n",
+                        filename, filesize, description, md5, ip, port, filesize, (long long)timestamp) < 0;
+        if (fclose(f) != 0) {
+            failed = 1;
+        }
+        if (failed) {
+            remove(path);
+            send_str(sock, "<$createtracker fail>\n");
+            return;
+        }
+    }
+
+    send_str(sock, "<$createtracker success>\n");
 }
 
 static void handle_updatetracker_req(socket_t sock) {
@@ -220,7 +271,7 @@ static void peer_handler(socket_t sock) {
         xtrct_fname(read_msg, " ");
         handle_get_req(sock, fname);
     } else if (cmd_is(read_msg, "createtracker")) {
-        handle_createtracker_req(sock);
+        handle_createtracker_req(sock, read_msg);
     } else if (cmd_is(read_msg, "updatetracker")) {
         handle_updatetracker_req(sock);
     } else {
@@ -261,7 +312,7 @@ int main(int argc, char **argv) {
     }
     logmsg("Tracker listening on port %d\n", server_port);
     logmsg("Torrent directory: %s\n", torrent_dir);
-    logmsg("LIST works. GET, createtracker, and updatetracker are still open.\n");
+    logmsg("LIST and createtracker work. GET, and updatetracker are still open.\n");
 
     for (;;) {
         struct sockaddr_in client;

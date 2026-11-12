@@ -211,12 +211,12 @@ static int handle_command(const char *input) {
         char md5[33];
         int filesize;
         int fields;
+        char command_ignore[32];
 
-        fields = sscanf(line, "%63s %255s %d %511[^0-9 ] %32s", filename, &filesize, description, md5);
+        fields = sscanf(line, "%63s %255s %d %511[^0-9 ] %32s", command_ignore, filename, &filesize, description, md5);
 
         if (fields != 5) {
-        logmsg("Fields %d", fields);
-        logmsg("Usage: createtracker <file> <size> <description> <md5>\n");
+            logmsg("Usage: createtracker <file> <size> <description> <md5>\n");
             return 0;
         }
 
