@@ -1,14 +1,28 @@
 /*
- * Peer, first slice.
+ * Peer program.
  *
  * Done:
  *   read the two config files and send LIST to the tracker.
+ *   listen thread: other peers connect and download file chunks from our
+ *   shared folder, max 1024 bytes per request. each connection gets its
+ *   own thread.
+ *   file transfer: "download <file> <ip> <port>" gets a file from another
+ *   peer 1024 bytes at a time and saves it in our shared folder.
  * Still to write:
- *   the listen thread, createtracker, updatetracker, GET, and downloading
- *   a file in 1024-byte pieces from other peers.
+ *   createtracker, updatetracker, GET, and downloading from several peers
+ *   at once using the tracker file.
+ *
+ * Protocol between peers (the project description does not define it):
+ *   request: <GET filename start_byte size>\n   (size is at most 1024)
+ *   reply:   <REP CHUNK n>\n followed by n bytes of the file
+ *            n can be less than size at the end of the file, 0 means
+ *            start_byte is past the end
+ *   error:   <GET invalid>\n
  */
 
 #include "netutil.h"
+
+#define MAX_CHUNK 1024
 
 static char tracker_ip[64] = "127.0.0.1";
 static int tracker_port = 3490;
@@ -143,6 +157,167 @@ static void do_list(void) {
     tracker_exchange("<$REQ LIST>\n", reply, (int)sizeof reply);
 }
 
+/* ---------------- listen thread (serving chunks to other peers) ---------------- */
+
+/* file names come from other peers, so no slashes allowed (no ../ tricks) */
+static int safe_name(const char *name) {
+    if (!name[0] || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        return 0;
+    }
+    return strchr(name, '/') == NULL && strchr(name, '\\') == NULL;
+}
+
+/* one thread per connected peer. it can ask for many chunks on the same connection */
+THREAD_FN(serve_peer, arg) {
+    socket_t s = (socket_t)(intptr_t)arg;
+    char line[1024];
+    char reply[64 + MAX_CHUNK];
+
+    while (recv_line(s, line, sizeof line) >= 0) {
+        char cmd[16];
+        char name[256];
+        long start;
+        int size;
+        char path[512];
+        FILE *f;
+        int got;
+        int hlen;
+
+        unwrap_msg(line);
+        if (sscanf(line, "%15s %255s %ld %d", cmd, name, &start, &size) != 4 ||
+            !str_ieq(cmd, "GET") || !safe_name(name) || start < 0) {
+            send_all(s, "<GET invalid>\n", 14);
+            continue;
+        }
+        if (size <= 0 || size > MAX_CHUNK) {
+            logmsg("Rejected request for %d bytes of %s (max is %d)\n", size, name, MAX_CHUNK);
+            send_all(s, "<GET invalid>\n", 14);
+            continue;
+        }
+        if (path_join(path, sizeof path, shared_dir, name) != 0 || !(f = fopen(path, "rb"))) {
+            send_all(s, "<GET invalid>\n", 14);
+            continue;
+        }
+
+        /* header and data go out in one send, two small sends in a row
+           get slowed down by Nagle's algorithm */
+        got = 0;
+        if (fseek(f, start, SEEK_SET) == 0) {
+            got = (int)fread(reply + 64, 1, (size_t)size, f);
+        }
+        fclose(f);
+        hlen = snprintf(reply, 64, "<REP CHUNK %d>\n", got);
+        memmove(reply + hlen, reply + 64, (size_t)got);
+        if (send_all(s, reply, hlen + got) < 0) {
+            break;
+        }
+    }
+    close_socket(s);
+    THREAD_RETURN;
+}
+
+/* welcoming socket: waits for other peers and gives each one its own thread */
+THREAD_FN(listen_thread, arg) {
+    socket_t ls = listen_on(my_port);
+    (void)arg;
+    if (ls == SOCK_INVALID) {
+        logmsg("Cannot listen on port %d, is another peer using it?\n", my_port);
+        THREAD_RETURN;
+    }
+    logmsg("Listening for other peers on port %d\n", my_port);
+
+    for (;;) {
+        struct sockaddr_in from;
+        socklen_t len = sizeof from;
+        thread_t t;
+        socket_t c = accept(ls, (struct sockaddr *)&from, &len);
+        if (c == SOCK_INVALID) {
+            continue;
+        }
+        logmsg("Peer %s connected\n", inet_ntoa(from.sin_addr));
+        if (!thread_start(&t, serve_peer, (void *)(intptr_t)c)) {
+            logmsg("Could not start a thread for that peer\n");
+            close_socket(c);
+            continue;
+        }
+        thread_detach(t);
+    }
+    THREAD_RETURN;
+}
+
+/* ---------------- file transfer (downloading from another peer) ---------------- */
+
+/* download <file> <ip> <port>: asks the other peer for the file 1024 bytes
+   at a time and saves it in our shared folder */
+static void do_download(const char *name, const char *ip, int port) {
+    socket_t s;
+    char path[512];
+    char line[256];
+    char buf[MAX_CHUNK];
+    FILE *out;
+    long start = 0;
+    int ok = 0;
+
+    if (!safe_name(name) || port < 1 || port > 65535) {
+        logmsg("Usage: download <filename> <ip> <port>\n");
+        return;
+    }
+    if (path_join(path, sizeof path, shared_dir, name) != 0) {
+        return;
+    }
+    s = connect_to(ip, port);
+    if (s == SOCK_INVALID) {
+        logmsg("Cannot connect to peer %s:%d\n", ip, port);
+        return;
+    }
+    out = fopen(path, "wb");
+    if (!out) {
+        logmsg("Cannot create %s\n", path);
+        close_socket(s);
+        return;
+    }
+
+    logmsg("File %s requested from %s %d\n", name, ip, port);
+    for (;;) {
+        char req[512];
+        int n;
+        snprintf(req, sizeof req, "<GET %s %ld %d>\n", name, start, MAX_CHUNK);
+        if (send_all(s, req, (int)strlen(req)) < 0 || recv_line(s, line, sizeof line) < 0) {
+            logmsg("Lost connection to %s %d\n", ip, port);
+            break;
+        }
+        if (sscanf(line, "<REP CHUNK %d>", &n) != 1 || n < 0 || n > MAX_CHUNK) {
+            logmsg("Peer said: %s (does it have %s?)\n", line, name);
+            break;
+        }
+        if (n == 0) {
+            ok = 1;     /* past the end of the file, we have all of it */
+            break;
+        }
+        if (recv_all(s, buf, n) < 0 || fwrite(buf, 1, (size_t)n, out) != (size_t)n) {
+            logmsg("Error while receiving %s\n", name);
+            break;
+        }
+        logmsg("Downloading %ld to %ld bytes of %s from %s %d\n", start, start + n - 1, name, ip, port);
+        start += n;
+        if (n < MAX_CHUNK) {
+            ok = 1;     /* short chunk means that was the last one */
+            break;
+        }
+    }
+    fclose(out);
+    close_socket(s);
+
+    if (ok) {
+        logmsg("File %s download complete (%ld bytes)\n", name, start);
+    } else {
+        remove(path);   /* don't leave half a file behind */
+        logmsg("Download of %s failed\n", name);
+    }
+}
+
+/* ---------------- commands ---------------- */
+
 static int is_list_command(const char *line) {
     char a[32];
     char b[32];
@@ -161,11 +336,12 @@ static void print_help(void) {
     logmsg(
         "Working now:\n"
         "  list\n"
+        "  download <filename> <ip> <port>   (get a file from another peer)\n"
+        "  listening on port %d so other peers can download from us\n"
         "Not written yet:\n"
         "  get <filename.track>\n"
         "  createtracker <file> <size> <description> <md5> [ip port]\n"
         "  updatetracker <file> <start> <end> [ip port]\n"
-        "  listening on port %d and downloading from other peers\n"
         "  quit\n",
         my_port);
 }
@@ -192,6 +368,17 @@ static int handle_command(const char *input) {
         do_list();
         return 0;
     }
+    if (str_ieq(cmd, "download")) {
+        char name[256];
+        char ip[64];
+        int port = 0;
+        if (sscanf(line, "%*s %255s %63s %d", name, ip, &port) != 3) {
+            logmsg("Usage: download <filename> <ip> <port>\n");
+            return 0;
+        }
+        do_download(name, ip, port);
+        return 0;
+    }
     if (str_ieq(cmd, "get") || str_ieq(cmd, "createtracker") || str_ieq(cmd, "updatetracker")) {
         logmsg("%s is not implemented yet.\n", cmd);
         return 0;
@@ -201,12 +388,12 @@ static int handle_command(const char *input) {
 }
 
 static void print_banner(void) {
-    logmsg("Peer ready enough to talk to the tracker.\n");
+    logmsg("Peer ready.\n");
     logmsg("  Tracker: %s:%d\n", tracker_ip, tracker_port);
-    logmsg("  Listen port from config: %d (not listening yet)\n", my_port);
+    logmsg("  Listen port: %d\n", my_port);
     logmsg("  Shared folder: %s\n", shared_dir);
     logmsg("  Update interval: %d seconds (not scheduled yet)\n", update_interval);
-    logmsg("Type help for what is left.\n");
+    logmsg("Type help for commands.\n");
 }
 
 int main(int argc, char **argv) {
@@ -236,6 +423,16 @@ int main(int argc, char **argv) {
     }
 
     print_banner();
+    {
+        thread_t t;
+        if (thread_start(&t, listen_thread, NULL)) {
+            thread_detach(t);
+        } else {
+            logmsg("Could not start the listen thread\n");
+        }
+    }
+    sleep_ms(100);   /* let the listen message print before the prompt */
+
     for (;;) {
         char line[1024];
         logmsg("peer> ");
