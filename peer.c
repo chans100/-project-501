@@ -143,6 +143,19 @@ static void do_list(void) {
     tracker_exchange("<$REQ LIST>\n", reply, (int)sizeof reply);
 }
 
+static int generate_md5(void) {
+    return 0; // Not Implemented
+}
+
+static void createtracker(char *filename, int filesize, char *description, char *md5) {
+    char msg[2048];
+    char reply[8192];
+
+    snprintf(msg, sizeof msg, "<createtracker %s %d %s %d %s %d>\n", filename, filesize, description, md5, tracker_ip, tracker_port);
+
+    tracker_exchange(msg, reply, (int)sizeof reply);
+}
+
 static int is_list_command(const char *line) {
     char a[32];
     char b[32];
@@ -161,12 +174,12 @@ static void print_help(void) {
     logmsg(
         "Working now:\n"
         "  list\n"
+        "  createtracker <file> <size> <description> <md5> [ip port]\n"
         "Not written yet:\n"
         "  get <filename.track>\n"
-        "  createtracker <file> <size> <description> <md5> [ip port]\n"
         "  updatetracker <file> <start> <end> [ip port]\n"
-        "  listening on port %d and downloading from other peers\n"
-        "  quit\n",
+        "  quit\n"
+        "Listening on port %d and downloading from other peers\n",
         my_port);
 }
 
@@ -192,7 +205,25 @@ static int handle_command(const char *input) {
         do_list();
         return 0;
     }
-    if (str_ieq(cmd, "get") || str_ieq(cmd, "createtracker") || str_ieq(cmd, "updatetracker")) {
+    if (str_ieq(cmd, "createtracker")) {
+        char filename[256];
+        char description[512];
+        char md5[33];
+        int filesize;
+        int fields;
+
+        fields = sscanf(line, "%63s %255s %d %511[^0-9 ] %32s", filename, &filesize, description, md5);
+
+        if (fields != 5) {
+        logmsg("Fields %d", fields);
+        logmsg("Usage: createtracker <file> <size> <description> <md5>\n");
+            return 0;
+        }
+
+        createtracker(filename, filesize, description, md5);
+        return 0;
+    }
+    if (str_ieq(cmd, "get") || str_ieq(cmd, "updatetracker")) {
         logmsg("%s is not implemented yet.\n", cmd);
         return 0;
     }
