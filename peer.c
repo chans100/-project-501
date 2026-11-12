@@ -1,13 +1,14 @@
 /*
  * Peer program.
  *
- * Talks to the tracker with LIST and GET.
- * Saves downloaded .track files into the local cache.
+ * Talks to the tracker with LIST, GET, createtracker, and updatetracker.
+ * Listens for other peers and serves shared files 1024 bytes at a time.
  */
 
 #include "netutil.h"
 
 #define REPLY_CAP (256 * 1024)
+#define MAX_CHUNK 1024
 
 static char tracker_ip[64] = "127.0.0.1";
 static int tracker_port = 3490;
@@ -152,6 +153,164 @@ static void createtracker(char *filename, int filesize, char *description, char 
     tracker_exchange(msg, reply, (int)sizeof reply);
 }
 
+static void updatetracker(char *filename, int start, int end) {
+    char msg[2048];
+    char reply[8192];
+
+    snprintf(msg, sizeof msg,
+             "<$updatetracker %s %d %d 127.0.0.1 %d>\n",
+             filename, start, end, my_port);
+    tracker_exchange(msg, reply, (int)sizeof reply);
+}
+
+static int safe_name(const char *name) {
+    if (!name || !name[0] || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        return 0;
+    }
+    return strchr(name, '/') == NULL && strchr(name, '\\') == NULL;
+}
+
+THREAD_FN(serve_peer, arg) {
+    socket_t s = (socket_t)(intptr_t)arg;
+    char line[1024];
+    char reply[64 + MAX_CHUNK];
+
+    while (recv_line(s, line, sizeof line) >= 0) {
+        char cmd[16];
+        char name[256];
+        long start;
+        int size;
+        char path[512];
+        FILE *f;
+        int got;
+        int hlen;
+
+        unwrap_msg(line);
+        if (sscanf(line, "%15s %255s %ld %d", cmd, name, &start, &size) != 4 ||
+            !str_ieq(cmd, "GET") || !safe_name(name) || start < 0) {
+            send_all(s, "<GET invalid>\n", 14);
+            continue;
+        }
+        if (size <= 0 || size > MAX_CHUNK) {
+            logmsg("Rejected request for %d bytes of %s (max is %d)\n", size, name, MAX_CHUNK);
+            send_all(s, "<GET invalid>\n", 14);
+            continue;
+        }
+        if (path_join(path, sizeof path, shared_dir, name) != 0 || !(f = fopen(path, "rb"))) {
+            send_all(s, "<GET invalid>\n", 14);
+            continue;
+        }
+
+        got = 0;
+        if (fseek(f, start, SEEK_SET) == 0) {
+            got = (int)fread(reply + 64, 1, (size_t)size, f);
+        }
+        fclose(f);
+        hlen = snprintf(reply, 64, "<REP CHUNK %d>\n", got);
+        memmove(reply + hlen, reply + 64, (size_t)got);
+        if (send_all(s, reply, hlen + got) < 0) {
+            break;
+        }
+    }
+    close_socket(s);
+    THREAD_RETURN;
+}
+
+THREAD_FN(listen_thread, arg) {
+    socket_t ls = listen_on(my_port);
+    (void)arg;
+    if (ls == SOCK_INVALID) {
+        logmsg("Cannot listen on port %d, is another peer using it?\n", my_port);
+        THREAD_RETURN;
+    }
+    logmsg("Listening for other peers on port %d\n", my_port);
+
+    for (;;) {
+        struct sockaddr_in from;
+        socklen_t len = sizeof from;
+        thread_t t;
+        socket_t c = accept(ls, (struct sockaddr *)&from, &len);
+        if (c == SOCK_INVALID) {
+            continue;
+        }
+        logmsg("Peer %s connected\n", inet_ntoa(from.sin_addr));
+        if (!thread_start(&t, serve_peer, (void *)(intptr_t)c)) {
+            logmsg("Could not start a thread for that peer\n");
+            close_socket(c);
+            continue;
+        }
+        thread_detach(t);
+    }
+    THREAD_RETURN;
+}
+
+static void do_download(const char *name, const char *ip, int port) {
+    socket_t s;
+    char path[512];
+    char line[256];
+    char buf[MAX_CHUNK];
+    FILE *out;
+    long start = 0;
+    int ok = 0;
+
+    if (!safe_name(name) || port < 1 || port > 65535) {
+        logmsg("Usage: download <filename> <ip> <port>\n");
+        return;
+    }
+    if (path_join(path, sizeof path, shared_dir, name) != 0) {
+        return;
+    }
+    s = connect_to(ip, port);
+    if (s == SOCK_INVALID) {
+        logmsg("Cannot connect to peer %s:%d\n", ip, port);
+        return;
+    }
+    out = fopen(path, "wb");
+    if (!out) {
+        logmsg("Cannot create %s\n", path);
+        close_socket(s);
+        return;
+    }
+
+    logmsg("File %s requested from %s %d\n", name, ip, port);
+    for (;;) {
+        char req[512];
+        int n;
+        snprintf(req, sizeof req, "<GET %s %ld %d>\n", name, start, MAX_CHUNK);
+        if (send_all(s, req, (int)strlen(req)) < 0 || recv_line(s, line, sizeof line) < 0) {
+            logmsg("Lost connection to %s %d\n", ip, port);
+            break;
+        }
+        if (sscanf(line, "<REP CHUNK %d>", &n) != 1 || n < 0 || n > MAX_CHUNK) {
+            logmsg("Peer said: %s (does it have %s?)\n", line, name);
+            break;
+        }
+        if (n == 0) {
+            ok = 1;
+            break;
+        }
+        if (recv_all(s, buf, n) < 0 || fwrite(buf, 1, (size_t)n, out) != (size_t)n) {
+            logmsg("Error while receiving %s\n", name);
+            break;
+        }
+        logmsg("Downloading %ld to %ld bytes of %s from %s %d\n", start, start + n - 1, name, ip, port);
+        start += n;
+        if (n < MAX_CHUNK) {
+            ok = 1;
+            break;
+        }
+    }
+    fclose(out);
+    close_socket(s);
+
+    if (ok) {
+        logmsg("File %s download complete (%ld bytes)\n", name, start);
+    } else {
+        remove(path);
+        logmsg("Download of %s failed\n", name);
+    }
+}
+
 static int extract_get_body(const char *text, char **out_body, size_t *out_len,
                             char *out_md5, size_t md5_cap) {
     const char *b;
@@ -290,8 +449,8 @@ static void print_help(void) {
         "  list\n"
         "  get <filename.track>\n"
         "  createtracker <file> <size> <description> <md5>\n"
-        "Not written yet:\n"
-        "  updatetracker <file> <start> <end> [ip port]\n"
+        "  updatetracker <file> <start> <end>\n"
+        "  download <filename> <ip> <port>\n"
         "  quit\n");
 }
 
@@ -334,12 +493,35 @@ static int handle_command(const char *input) {
         createtracker(filename, filesize, description, md5);
         return 0;
     }
+    if (str_ieq(cmd, "updatetracker")) {
+        char filename[256];
+        int start = 0;
+        int end = 0;
+        int fields;
+        char command_ignore[32];
+
+        fields = sscanf(line, "%63s %255s %d %d",
+                        command_ignore, filename, &start, &end);
+        if (fields != 4 || end < start) {
+            logmsg("Usage: updatetracker <file> <start> <end>\n");
+            return 0;
+        }
+        updatetracker(filename, start, end);
+        return 0;
+    }
     if (str_ieq(cmd, "get")) {
         do_get(line);
         return 0;
     }
-    if (str_ieq(cmd, "updatetracker")) {
-        logmsg("%s is not implemented yet.\n", cmd);
+    if (str_ieq(cmd, "download")) {
+        char name[256];
+        char ip[64];
+        int port = 0;
+        if (sscanf(line, "%*s %255s %63s %d", name, ip, &port) != 3) {
+            logmsg("Usage: download <filename> <ip> <port>\n");
+            return 0;
+        }
+        do_download(name, ip, port);
         return 0;
     }
     logmsg("Unknown command. Type help.\n");
@@ -349,6 +531,7 @@ static int handle_command(const char *input) {
 static void print_banner(void) {
     logmsg("Peer ready.\n");
     logmsg("  Tracker: %s:%d\n", tracker_ip, tracker_port);
+    logmsg("  Listen port: %d\n", my_port);
     logmsg("  Shared folder: %s\n", shared_dir);
     logmsg("Type help for commands.\n");
 }
@@ -380,6 +563,16 @@ int main(int argc, char **argv) {
     }
 
     print_banner();
+    {
+        thread_t t;
+        if (thread_start(&t, listen_thread, NULL)) {
+            thread_detach(t);
+        } else {
+            logmsg("Could not start the listen thread\n");
+        }
+    }
+    sleep_ms(100);
+
     for (;;) {
         char line[1024];
         logmsg("peer> ");
