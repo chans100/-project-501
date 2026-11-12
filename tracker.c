@@ -2,12 +2,14 @@
  * Tracker server, first slice.
  *
  * Done:
- *   read sconfig, listen, hand each connection to a worker thread, answer LIST.
+ *   read sconfig, listen, hand each connection to a worker thread,
+ *   answer LIST, createtracker, and updatetracker.
  * Still to write:
- *   GET, createtracker, updatetracker, and dropping peers that stop updating.
+ *   GET.
  */
 
 #include "netutil.h"
+#include <time.h>
 
 #ifndef _WIN32
 #include <dirent.h>
@@ -18,6 +20,7 @@
 
 static char torrent_dir[256] = "torrents";
 static int server_port = 3490;
+static int peer_timeout = 900;
 static char read_msg[MAXLINE];
 static char fname[256];
 
@@ -81,12 +84,17 @@ static int load_sconfig(const char *dir) {
             server_port = atoi(line);
         } else if (n == 2) {
             snprintf(torrent_dir, sizeof torrent_dir, "%s", line);
+        } else if (n == 3) {
+            peer_timeout = atoi(line);
         }
     }
     fclose(f);
     if (server_port < 1 || server_port > 65535) {
         logmsg("sconfig has an invalid port\n");
         return -1;
+    }
+    if (peer_timeout < 1) {
+        peer_timeout = 900;
     }
     return 0;
 }
@@ -238,10 +246,151 @@ static void handle_createtracker_req(socket_t sock, const char *request) {
     send_str(sock, "<$createtracker success>\n");
 }
 
-static void handle_updatetracker_req(socket_t sock) {
-    /* TODO: add or refresh this peer's byte range and drop silent peers. */
-    logmsg("updatetracker is not implemented yet\n");
-    send_str(sock, "<$updatetracker fail>\n");
+static void handle_updatetracker_req(socket_t sock, const char *request) {
+    char command[32];
+    char filename[256];
+    int start_byte = 0;
+    int end_byte = 0;
+    char ip[64];
+    int port = 0;
+    int fields;
+    char path[512];
+    char tmp_path[520];
+    char reply[512];
+    FILE *f;
+    char headers[32][512];
+    int nheader = 0;
+    char peer_ip[128][64];
+    int peer_port[128];
+    int peer_start[128];
+    int peer_end[128];
+    long long peer_time[128];
+    int npeers = 0;
+    int i;
+    int found = 0;
+    time_t now;
+    int failed;
+
+    filename[0] = '\0';
+    fields = sscanf(request, "%31s %255s %d %d %63s %d",
+                    command, filename, &start_byte, &end_byte, ip, &port);
+    if (fields != 6 || end_byte < start_byte || port < 1 || port > 65535) {
+        if (filename[0] != '\0') {
+            snprintf(reply, sizeof reply, "<$updatetracker %s fail>\n", filename);
+        } else {
+            snprintf(reply, sizeof reply, "<$updatetracker fail>\n");
+        }
+        send_str(sock, reply);
+        return;
+    }
+
+    if (path_join(path, sizeof path, torrent_dir, filename) != 0) {
+        snprintf(reply, sizeof reply, "<$updatetracker %s fail>\n", filename);
+        send_str(sock, reply);
+        return;
+    }
+    strcat(path, ".track");
+
+    f = fopen(path, "rb");
+    if (!f) {
+        snprintf(reply, sizeof reply, "<$updatetracker %s ferr>\n", filename);
+        send_str(sock, reply);
+        return;
+    }
+
+    while (npeers < 128 && fgets(reply, sizeof reply, f)) {
+        char line[512];
+        char parsed_ip[64];
+        int parsed_port, parsed_start, parsed_end;
+        long long parsed_time;
+
+        snprintf(line, sizeof line, "%s", reply);
+        trim_inplace(line);
+        if (line[0] == '\0' || line[0] == '#') {
+            continue;
+        }
+        if (sscanf(line, "%63[^:]:%d:%d:%d:%lld",
+                   parsed_ip, &parsed_port, &parsed_start, &parsed_end, &parsed_time) == 5) {
+            snprintf(peer_ip[npeers], 64, "%s", parsed_ip);
+            peer_port[npeers] = parsed_port;
+            peer_start[npeers] = parsed_start;
+            peer_end[npeers] = parsed_end;
+            peer_time[npeers] = parsed_time;
+            npeers++;
+        } else if (nheader < 32) {
+            snprintf(headers[nheader], sizeof headers[nheader], "%s", line);
+            nheader++;
+        }
+    }
+    fclose(f);
+
+    now = time(NULL);
+    i = 0;
+    while (i < npeers) {
+        if (now > peer_time[i] && (now - peer_time[i]) > peer_timeout) {
+            char moved_ip[64];
+            npeers--;
+            snprintf(moved_ip, sizeof moved_ip, "%s", peer_ip[npeers]);
+            peer_port[i] = peer_port[npeers];
+            peer_start[i] = peer_start[npeers];
+            peer_end[i] = peer_end[npeers];
+            peer_time[i] = peer_time[npeers];
+            snprintf(peer_ip[i], 64, "%s", moved_ip);
+            continue;
+        }
+        if (strcmp(peer_ip[i], ip) == 0 && peer_port[i] == port) {
+            peer_start[i] = start_byte;
+            peer_end[i] = end_byte;
+            peer_time[i] = (long long)now;
+            found = 1;
+        }
+        i++;
+    }
+    if (!found) {
+        if (npeers >= 128) {
+            snprintf(reply, sizeof reply, "<$updatetracker %s fail>\n", filename);
+            send_str(sock, reply);
+            return;
+        }
+        snprintf(peer_ip[npeers], 64, "%s", ip);
+        peer_port[npeers] = port;
+        peer_start[npeers] = start_byte;
+        peer_end[npeers] = end_byte;
+        peer_time[npeers] = (long long)now;
+        npeers++;
+    }
+
+    snprintf(tmp_path, sizeof tmp_path, "%s.tmp", path);
+    f = fopen(tmp_path, "w");
+    if (!f) {
+        snprintf(reply, sizeof reply, "<$updatetracker %s fail>\n", filename);
+        send_str(sock, reply);
+        return;
+    }
+    failed = 0;
+    for (i = 0; i < nheader; i++) {
+        if (fprintf(f, "%s\n", headers[i]) < 0) {
+            failed = 1;
+        }
+    }
+    for (i = 0; i < npeers; i++) {
+        if (fprintf(f, "%s:%d:%d:%d:%lld\n",
+                    peer_ip[i], peer_port[i], peer_start[i], peer_end[i], peer_time[i]) < 0) {
+            failed = 1;
+        }
+    }
+    if (fclose(f) != 0) {
+        failed = 1;
+    }
+    if (failed || remove(path) != 0 || rename(tmp_path, path) != 0) {
+        remove(tmp_path);
+        snprintf(reply, sizeof reply, "<$updatetracker %s fail>\n", filename);
+        send_str(sock, reply);
+        return;
+    }
+
+    snprintf(reply, sizeof reply, "<$updatetracker %s success>\n", filename);
+    send_str(sock, reply);
 }
 
 static int is_list_cmd(const char *msg) {
@@ -273,7 +422,7 @@ static void peer_handler(socket_t sock) {
     } else if (cmd_is(read_msg, "createtracker")) {
         handle_createtracker_req(sock, read_msg);
     } else if (cmd_is(read_msg, "updatetracker")) {
-        handle_updatetracker_req(sock);
+        handle_updatetracker_req(sock, read_msg);
     } else {
         send_str(sock, "<$ERR unknown>\n");
     }
@@ -312,7 +461,7 @@ int main(int argc, char **argv) {
     }
     logmsg("Tracker listening on port %d\n", server_port);
     logmsg("Torrent directory: %s\n", torrent_dir);
-    logmsg("LIST and createtracker work. GET, and updatetracker are still open.\n");
+    logmsg("LIST, createtracker, and updatetracker work. GET is still open.\n");
 
     for (;;) {
         struct sockaddr_in client;
