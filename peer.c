@@ -1,14 +1,13 @@
 /*
- * Peer, first slice.
+ * Peer program.
  *
- * Done:
- *   read the two config files and send LIST to the tracker.
- * Still to write:
- *   the listen thread, createtracker, updatetracker, GET, and downloading
- *   a file in 1024-byte pieces from other peers.
+ * Talks to the tracker with LIST and GET.
+ * Saves downloaded .track files into the local cache.
  */
 
 #include "netutil.h"
+
+#define REPLY_CAP (256 * 1024)
 
 static char tracker_ip[64] = "127.0.0.1";
 static int tracker_port = 3490;
@@ -139,21 +138,136 @@ static int tracker_exchange(const char *msg, char *reply, int cap) {
 }
 
 static void do_list(void) {
-    char reply[8192];
+    char reply[REPLY_CAP];
     tracker_exchange("<$REQ LIST>\n", reply, (int)sizeof reply);
-}
-
-static int generate_md5(void) {
-    return 0; // Not Implemented
 }
 
 static void createtracker(char *filename, int filesize, char *description, char *md5) {
     char msg[2048];
     char reply[8192];
 
-    snprintf(msg, sizeof msg, "<createtracker %s %d %s %d %s %d>\n", filename, filesize, description, md5, tracker_ip, tracker_port);
-
+    snprintf(msg, sizeof msg,
+             "<$createtracker %s %d %s %s 127.0.0.1 %d>\n",
+             filename, filesize, description, md5, my_port);
     tracker_exchange(msg, reply, (int)sizeof reply);
+}
+
+static int extract_get_body(const char *text, char **out_body, size_t *out_len,
+                            char *out_md5, size_t md5_cap) {
+    const char *b;
+    const char *e;
+    const char *body;
+    const char *md5_at;
+    size_t blen;
+    *out_body = NULL;
+    *out_len = 0;
+    if (out_md5 && md5_cap) {
+        out_md5[0] = '\0';
+    }
+    b = strstr(text, "REP GET BEGIN");
+    if (!b) {
+        return -1;
+    }
+    body = strchr(b, '\n');
+    if (!body) {
+        return -1;
+    }
+    body++;
+    e = strstr(body, "<$REP GET END");
+    if (!e) {
+        e = strstr(body, "<REP GET END");
+    }
+    if (!e) {
+        return -1;
+    }
+    blen = (size_t)(e - body);
+    {
+        char *copy = (char *)malloc(blen + 1);
+        if (!copy) {
+            return -1;
+        }
+        memcpy(copy, body, blen);
+        copy[blen] = '\0';
+        *out_body = copy;
+        *out_len = blen;
+    }
+    md5_at = strstr(e, "END");
+    if (out_md5 && md5_cap && md5_at) {
+        md5_at += 3;
+        while (*md5_at && isspace((unsigned char)*md5_at)) {
+            md5_at++;
+        }
+        sscanf(md5_at, "%32s", out_md5);
+        {
+            size_t n = strlen(out_md5);
+            if (n > 0 && out_md5[n - 1] == '>') {
+                out_md5[n - 1] = '\0';
+            }
+        }
+    }
+    return 0;
+}
+
+static void do_get(const char *line) {
+    char name[256] = "";
+    char msg[512];
+    char *reply;
+    char *body = NULL;
+    size_t body_len = 0;
+    char claimed[40] = "";
+    char actual[33];
+    char cache_path[512];
+    int n;
+
+    if (sscanf(line, "%*s %255s", name) != 1 || name[0] == '\0') {
+        logmsg("Usage: get <filename.track>\n");
+        return;
+    }
+    if (!ends_with(name, ".track")) {
+        size_t len = strlen(name);
+        if (len + 6 < sizeof name) {
+            memcpy(name + len, ".track", 7);
+        }
+    }
+
+    reply = (char *)malloc(REPLY_CAP);
+    if (!reply) {
+        return;
+    }
+    snprintf(msg, sizeof msg, "<$GET %s>\n", name);
+    n = tracker_exchange(msg, reply, REPLY_CAP);
+    if (n < 0) {
+        free(reply);
+        return;
+    }
+    if (strstr(reply, "ferr") != NULL && strstr(reply, "REP GET BEGIN") == NULL) {
+        logmsg("GET failed for %s\n", name);
+        free(reply);
+        return;
+    }
+    if (extract_get_body(reply, &body, &body_len, claimed, sizeof claimed) != 0) {
+        logmsg("Malformed GET reply for %s\n", name);
+        free(reply);
+        return;
+    }
+    free(reply);
+
+    md5_buffer(body, body_len, actual);
+    if (claimed[0] && strcmp(claimed, actual) != 0) {
+        logmsg("GET MD5 mismatch for %s (got %s, expected %s)\n", name, actual, claimed);
+        free(body);
+        return;
+    }
+
+    ensure_dir("cache");
+    if (path_join(cache_path, sizeof cache_path, "cache", name) != 0 ||
+        write_file_all(cache_path, body, body_len) != 0) {
+        logmsg("Cannot save tracker file to cache\n");
+        free(body);
+        return;
+    }
+    free(body);
+    logmsg("Saved tracker file to %s (MD5 ok)\n", cache_path);
 }
 
 static int is_list_command(const char *line) {
@@ -172,15 +286,13 @@ static int is_list_command(const char *line) {
 
 static void print_help(void) {
     logmsg(
-        "Working now:\n"
+        "Commands:\n"
         "  list\n"
-        "  createtracker <file> <size> <description> <md5> [ip port]\n"
-        "Not written yet:\n"
         "  get <filename.track>\n"
+        "  createtracker <file> <size> <description> <md5>\n"
+        "Not written yet:\n"
         "  updatetracker <file> <start> <end> [ip port]\n"
-        "  quit\n"
-        "Listening on port %d and downloading from other peers\n",
-        my_port);
+        "  quit\n");
 }
 
 static int handle_command(const char *input) {
@@ -213,17 +325,20 @@ static int handle_command(const char *input) {
         int fields;
         char command_ignore[32];
 
-        fields = sscanf(line, "%63s %255s %d %511[^0-9 ] %32s", command_ignore, filename, &filesize, description, md5);
-
+        fields = sscanf(line, "%63s %255s %d %511s %32s",
+                        command_ignore, filename, &filesize, description, md5);
         if (fields != 5) {
             logmsg("Usage: createtracker <file> <size> <description> <md5>\n");
             return 0;
         }
-
         createtracker(filename, filesize, description, md5);
         return 0;
     }
-    if (str_ieq(cmd, "get") || str_ieq(cmd, "updatetracker")) {
+    if (str_ieq(cmd, "get")) {
+        do_get(line);
+        return 0;
+    }
+    if (str_ieq(cmd, "updatetracker")) {
         logmsg("%s is not implemented yet.\n", cmd);
         return 0;
     }
@@ -232,12 +347,10 @@ static int handle_command(const char *input) {
 }
 
 static void print_banner(void) {
-    logmsg("Peer ready enough to talk to the tracker.\n");
+    logmsg("Peer ready.\n");
     logmsg("  Tracker: %s:%d\n", tracker_ip, tracker_port);
-    logmsg("  Listen port from config: %d (not listening yet)\n", my_port);
     logmsg("  Shared folder: %s\n", shared_dir);
-    logmsg("  Update interval: %d seconds (not scheduled yet)\n", update_interval);
-    logmsg("Type help for what is left.\n");
+    logmsg("Type help for commands.\n");
 }
 
 int main(int argc, char **argv) {

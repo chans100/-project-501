@@ -1,11 +1,7 @@
 /*
- * Tracker server, first slice.
+ * Tracker server.
  *
- * Done:
- *   read sconfig, listen, hand each connection to a worker thread,
- *   answer LIST, createtracker, and updatetracker.
- * Still to write:
- *   GET.
+ * Handles LIST, GET, createtracker, and updatetracker.
  */
 
 #include "netutil.h"
@@ -22,7 +18,7 @@ static char torrent_dir[256] = "torrents";
 static int server_port = 3490;
 static int peer_timeout = 900;
 static char read_msg[MAXLINE];
-static char fname[256];
+static mutex_t track_lock;
 
 static void send_str(socket_t sock, const char *text) {
     send_all(sock, text, (int)strlen(text));
@@ -99,7 +95,6 @@ static int load_sconfig(const char *dir) {
     return 0;
 }
 
-/* Collect *.track names. Size and MD5 still have to be read out of each file. */
 static int collect_track_names(char names[][256], int cap) {
     int count = 0;
 #ifdef _WIN32
@@ -150,43 +145,125 @@ static void strip_track_suffix(char *name) {
     }
 }
 
+static void track_path(char *out, size_t cap, const char *name) {
+    char base[256];
+    snprintf(base, sizeof base, "%s", name);
+    if (!ends_with(base, ".track")) {
+        size_t n = strlen(base);
+        if (n + 6 < sizeof base) {
+            memcpy(base + n, ".track", 7);
+        }
+    }
+    path_join(out, cap, torrent_dir, base);
+}
+
+typedef struct {
+    char filename[256];
+    long long filesize;
+    char md5[40];
+} track_info;
+
+static int read_track_info(const char *path, track_info *ti) {
+    FILE *f;
+    char line[1024];
+    memset(ti, 0, sizeof *ti);
+    f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+    while (fgets(line, sizeof line, f)) {
+        trim_inplace(line);
+        if (line[0] == '\0' || line[0] == '#') {
+            continue;
+        }
+        if (strncmp(line, "Filename:", 9) == 0) {
+            snprintf(ti->filename, sizeof ti->filename, "%s", line + 9);
+            trim_inplace(ti->filename);
+        } else if (strncmp(line, "Filesize:", 9) == 0 || strncmp(line, "Fizesize:", 9) == 0) {
+            ti->filesize = atoll(line + 9);
+        } else if (strncmp(line, "MD5:", 4) == 0) {
+            snprintf(ti->md5, sizeof ti->md5, "%s", line + 4);
+            trim_inplace(ti->md5);
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
 static void handle_list_req(socket_t sock) {
     char names[MAX_TRACK_FILES][256];
     int n;
     int i;
-    char line[320];
+    char line[512];
+    char path[512];
 
+    mutex_lock(&track_lock);
     n = collect_track_names(names, MAX_TRACK_FILES);
     snprintf(line, sizeof line, "<$REP LIST %d>\n", n);
     send_str(sock, line);
     for (i = 0; i < n; i++) {
-        strip_track_suffix(names[i]);
-        /* TODO: replace 0 and TODO with the file size and MD5 from the tracker file. */
-        snprintf(line, sizeof line, "<$%d %s 0 TODO>\n", i + 1, names[i]);
+        track_info ti;
+        char display[256];
+        long long size = 0;
+        char md5[40] = "0";
+        snprintf(display, sizeof display, "%s", names[i]);
+        strip_track_suffix(display);
+        path_join(path, sizeof path, torrent_dir, names[i]);
+        if (read_track_info(path, &ti) == 0) {
+            size = ti.filesize;
+            if (ti.md5[0]) {
+                snprintf(md5, sizeof md5, "%s", ti.md5);
+            }
+            if (ti.filename[0]) {
+                snprintf(display, sizeof display, "%s", ti.filename);
+            }
+        }
+        snprintf(line, sizeof line, "<$%d %s %lld %s>\n", i + 1, display, (long long)size, md5);
         send_str(sock, line);
     }
+    mutex_unlock(&track_lock);
     send_str(sock, "<$REP LIST END>\n");
     logmsg("list request handled (%d files).\n", n);
 }
 
-static void xtrct_fname(const char *msg, const char *delim) {
-    const char *p = msg;
-    (void)delim;
-    fname[0] = '\0';
-    while (*p && !isspace((unsigned char)*p)) {
-        p++;
-    }
-    while (*p && isspace((unsigned char)*p)) {
-        p++;
-    }
-    sscanf(p, "%255s", fname);
-}
-
 static void handle_get_req(socket_t sock, const char *name) {
-    (void)name;
-    /* TODO: send <$REP GET BEGIN>, the tracker file, and <$REP GET END md5>. */
-    logmsg("GET is not implemented yet\n");
-    send_str(sock, "<$REP GET ferr>\n");
+    char path[512];
+    char *data = NULL;
+    size_t len = 0;
+    char md5[33];
+    char endline[128];
+
+    if (!name || !name[0]) {
+        send_str(sock, "<$REP GET ferr>\n");
+        return;
+    }
+    track_path(path, sizeof path, name);
+    mutex_lock(&track_lock);
+    if (read_file_all(path, &data, &len) != 0) {
+        mutex_unlock(&track_lock);
+        logmsg("GET missing tracker file: %s\n", path);
+        send_str(sock, "<$REP GET ferr>\n");
+        return;
+    }
+    mutex_unlock(&track_lock);
+
+    if (len == 0 || data[len - 1] != '\n') {
+        char *grown = (char *)realloc(data, len + 1);
+        if (!grown) {
+            free(data);
+            send_str(sock, "<$REP GET ferr>\n");
+            return;
+        }
+        data = grown;
+        data[len++] = '\n';
+    }
+    md5_buffer(data, len, md5);
+    send_str(sock, "<$REP GET BEGIN>\n");
+    send_all(sock, data, (int)len);
+    snprintf(endline, sizeof endline, "<$REP GET END %s>\n", md5);
+    send_str(sock, endline);
+    free(data);
+    logmsg("GET %s (%zu bytes)\n", name, len);
 }
 
 static void handle_createtracker_req(socket_t sock, const char *request) {
@@ -200,7 +277,6 @@ static void handle_createtracker_req(socket_t sock, const char *request) {
     int fields;
     char path[512];
     FILE *f;
-    size_t i;
 
     fields = sscanf(request, "%31s %255s %d %511s %32s %63s %d",
                     command, filename, &filesize, description, md5, ip, &port);
@@ -216,15 +292,18 @@ static void handle_createtracker_req(socket_t sock, const char *request) {
     strcat(path, ".track");
 
     logmsg(path);
+    mutex_lock(&track_lock);
     f = fopen(path, "rb");
     if (f) {
         fclose(f);
+        mutex_unlock(&track_lock);
         send_str(sock, "<$createtracker ferr>\n");
         return;
     }
 
     f = fopen(path, "w");
     if (!f) {
+        mutex_unlock(&track_lock);
         send_str(sock, "<$createtracker fail>\n");
         return;
     }
@@ -238,11 +317,13 @@ static void handle_createtracker_req(socket_t sock, const char *request) {
         }
         if (failed) {
             remove(path);
+            mutex_unlock(&track_lock);
             send_str(sock, "<$createtracker fail>\n");
             return;
         }
     }
 
+    mutex_unlock(&track_lock);
     send_str(sock, "<$createtracker success>\n");
 }
 
@@ -291,8 +372,10 @@ static void handle_updatetracker_req(socket_t sock, const char *request) {
     }
     strcat(path, ".track");
 
+    mutex_lock(&track_lock);
     f = fopen(path, "rb");
     if (!f) {
+        mutex_unlock(&track_lock);
         snprintf(reply, sizeof reply, "<$updatetracker %s ferr>\n", filename);
         send_str(sock, reply);
         return;
@@ -348,6 +431,7 @@ static void handle_updatetracker_req(socket_t sock, const char *request) {
     }
     if (!found) {
         if (npeers >= 128) {
+            mutex_unlock(&track_lock);
             snprintf(reply, sizeof reply, "<$updatetracker %s fail>\n", filename);
             send_str(sock, reply);
             return;
@@ -363,6 +447,7 @@ static void handle_updatetracker_req(socket_t sock, const char *request) {
     snprintf(tmp_path, sizeof tmp_path, "%s.tmp", path);
     f = fopen(tmp_path, "w");
     if (!f) {
+        mutex_unlock(&track_lock);
         snprintf(reply, sizeof reply, "<$updatetracker %s fail>\n", filename);
         send_str(sock, reply);
         return;
@@ -384,11 +469,13 @@ static void handle_updatetracker_req(socket_t sock, const char *request) {
     }
     if (failed || remove(path) != 0 || rename(tmp_path, path) != 0) {
         remove(tmp_path);
+        mutex_unlock(&track_lock);
         snprintf(reply, sizeof reply, "<$updatetracker %s fail>\n", filename);
         send_str(sock, reply);
         return;
     }
 
+    mutex_unlock(&track_lock);
     snprintf(reply, sizeof reply, "<$updatetracker %s success>\n", filename);
     send_str(sock, reply);
 }
@@ -417,8 +504,9 @@ static void peer_handler(socket_t sock) {
     if (is_list_cmd(read_msg)) {
         handle_list_req(sock);
     } else if (cmd_is(read_msg, "get")) {
-        xtrct_fname(read_msg, " ");
-        handle_get_req(sock, fname);
+        char name[256] = "";
+        sscanf(read_msg, "%*s %255s", name);
+        handle_get_req(sock, name);
     } else if (cmd_is(read_msg, "createtracker")) {
         handle_createtracker_req(sock, read_msg);
     } else if (cmd_is(read_msg, "updatetracker")) {
@@ -430,7 +518,7 @@ static void peer_handler(socket_t sock) {
 
 THREAD_FN(worker, arg) {
     socket_t sock = (socket_t)(intptr_t)arg;
-    set_io_timeout(sock, 5000);
+    set_io_timeout(sock, 10000);
     peer_handler(sock);
     close_socket(sock);
     THREAD_RETURN;
@@ -442,6 +530,7 @@ int main(int argc, char **argv) {
 
     (void)argc;
     net_start();
+    mutex_init(&track_lock);
     if (load_sconfig(".") != 0) {
         if (!exe_dir(argv ? argv[0] : NULL, dir, sizeof dir) || load_sconfig(dir) != 0) {
             logmsg("No sconfig found. Using port %d and folder '%s'.\n", server_port, torrent_dir);
@@ -461,7 +550,7 @@ int main(int argc, char **argv) {
     }
     logmsg("Tracker listening on port %d\n", server_port);
     logmsg("Torrent directory: %s\n", torrent_dir);
-    logmsg("LIST, createtracker, and updatetracker work. GET is still open.\n");
+    logmsg("Commands: LIST, GET, createtracker, updatetracker\n");
 
     for (;;) {
         struct sockaddr_in client;
